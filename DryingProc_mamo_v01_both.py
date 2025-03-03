@@ -196,125 +196,154 @@ del rightInlet1, rightInlet2, velocity
 # Concentraiton Simulations
 
 # %%
-
-# YOU NEED the following variables: 
-# xVelocity
-# yVelocity
-# uCell = xVelocity.value
-# vCell = yVelocity.value
-
 #!/usr/bin/env python
 
 import fipy as fp
 import numpy as np
+from fipy.tools import numerix
+from fipy.variables.faceGradVariable import _FaceGradVariable
 
 ###############################################################################
-# 1. Domain: same 100x100 grid used for velocity
+# Mesh: 100×100
 ###############################################################################
-nx, ny = 100, 100
-Lx = Ly = 100.0
-dx = dy = Lx / nx
-
+nx = ny = 100
+dx = dy = 1.0
 mesh = fp.Grid2D(nx=nx, ny=ny, dx=dx, dy=dy)
 
 ###############################################################################
-# 2. Import or define the final velocities from SIMPLE
+# Momentum variables (SIMPLE)
 ###############################################################################
-# Here we assume you have arrays "uData" and "vData" that correspond
-# to the converged xVelocity, yVelocity (cell-centered) from the momentum step.
-# For illustration, we'll just show placeholders:
-# (In a real code, you'd either pass them directly, or load from a file.)
+pressure   = fp.CellVariable(mesh=mesh, name="pressure", value=0.0)
+pCorr      = fp.CellVariable(mesh=mesh, name="pCorr",    value=0.0)
+xVelocity  = fp.CellVariable(mesh=mesh, name="xVelocity", value=0.0)
+yVelocity  = fp.CellVariable(mesh=mesh, name="yVelocity", value=0.0)
 
-#uData = np.zeros(nx*ny)  # Placeholders: In reality, fill with your final xVelocity
-#vData = np.zeros(nx*ny)  # Placeholders: final yVelocity
-uData = xVelocity.value.reshape(100,100)
-vData = yVelocity.value.reshape(100,100)
+# FaceVariable used only internally for Rhie–Chow
+faceVelocity = fp.FaceVariable(mesh=mesh, rank=1)
 
-# e.g. uData[i] = xVelocity.value[i] from your momentum code.
+# Momentum eq (Stokes)
+viscosity = 1.0
+xMomEq = fp.DiffusionTerm(coeff=viscosity) - pressure.grad.dot([1.,0.])
+yMomEq = fp.DiffusionTerm(coeff=viscosity) - pressure.grad.dot([0.,1.])
 
-# Build FiPy CellVariables from these arrays
-uCell = fp.CellVariable(mesh=mesh, value=uData, name="u-vel")
-vCell = fp.CellVariable(mesh=mesh, value=vData, name="v-vel")
+ap = fp.CellVariable(mesh=mesh, value=1.0)
+coeff = (1. / ap.arithmeticFaceValue) * mesh._faceAreas * mesh._cellDistances
+pCorrEq = fp.DiffusionTerm(coeff=coeff) - faceVelocity.divergence
 
-###############################################################################
-# 3. Define the species concentration
-###############################################################################
-concentration = fp.CellVariable(mesh=mesh, name="solventConcentration", value=0.0)
-
-# You might do a "solvent mass fraction" or something similar. We'll keep it simple.
+pressureRelaxation = 0.8
+velocityRelaxation = 0.5
 
 ###############################################################################
-# 4. PDE Coefficients
+# Momentum boundary conditions example
+# Let's pick some generic BC: no-slip all around except a "top-lid" v=0, u=1.0 
 ###############################################################################
-D = 1.0e-3  # diffusion coefficient (example)
-
-###############################################################################
-# 5. Boundary Conditions
-# 
-# We'll approximate:
-#   - Right top inlets => c=0 (pure hot air, zero solvent).
-#   - Bottom => c=1.0, representing a saturated film
-#   - Left outlets => zero gradient (outflow).
-#   - Everything else => no flux.
-###############################################################################
-
-# Identify boundary faces
 facesLeft   = mesh.facesLeft
 facesRight  = mesh.facesRight
 facesBottom = mesh.facesBottom
 facesTop    = mesh.facesTop
 
-Yfaces = mesh.faceCenters[1]
+# Default: no-slip
+xVelocity.constrain(0.0, mesh.exteriorFaces)
+yVelocity.constrain(0.0, mesh.exteriorFaces)
 
-# Right-top inlets (two segments):
-# e.g. [70..75], [90..95] from your velocity scenario
-inlet1 = facesRight & (Yfaces>=70) & (Yfaces<75)
-inlet2 = facesRight & (Yfaces>=90) & (Yfaces<95)
-
-# We set c=0 on these inlets
-concentration.constrain(0.0, where=inlet1)
-concentration.constrain(0.0, where=inlet2)
-
-# Bottom => c=1, to represent film source
-concentration.constrain(1.0, where=facesBottom)
-
-# Left outlets => zero gradient => typical outflow
-# In FiPy, that means do NOT set a Dirichlet constraint. We'll do:
-concentration.faceGrad[0].constrain(0.0, where=facesLeft)
-
-# Top => no flux => zero gradient in y
-concentration.faceGrad[1].constrain(0.0, where=facesTop)
-
-# The remaining part of the right boundary not in [70..75] or [90..95]
-# you might also want no flux or zero gradient, e.g.:
-noFluxRight = facesRight & ~inlet1 & ~inlet2
-concentration.faceGrad[0].constrain(0.0, where=noFluxRight)
+# For demonstration: top boundary is a "moving lid" in x
+xVelocity.constrain(1.0, facesTop)
+yVelocity.constrain(0.0, facesTop)
 
 ###############################################################################
-# 6. Define the Convection–Diffusion Equation
+# SIMPLE iteration
 ###############################################################################
-#   d(c)/dt + div(u*c) = div(D grad(c))
-# We'll define the velocity as a tuple of cell data for ConvectionTerm.
-# FiPy expects something like ConvectionTerm(coeff=(uCell, vCell)).
+def solveMomentum(nSweeps=50):
+    for sweep in range(nSweeps):
+        # (a) Solve x-momentum
+        xMomEq.cacheMatrix()
+        xRes = xMomEq.sweep(var=xVelocity, underRelaxation=velocityRelaxation)
+        xMat = xMomEq.matrix
 
-eq = (
-    fp.TransientTerm(var=concentration)
-    + fp.ConvectionTerm(coeff=(uCell, vCell), var=concentration)
-    == fp.DiffusionTerm(coeff=D, var=concentration)
+        # (b) Solve y-momentum
+        yRes = yMomEq.sweep(var=yVelocity, underRelaxation=velocityRelaxation)
+
+        # (c) Update ap from x-momentum diagonal
+        ap[:] = -numerix.asarray(xMat.takeDiagonal())
+
+        # (d) Rhie–Chow face velocity
+        presGrad = pressure.grad
+        facePresGrad = _FaceGradVariable(pressure)
+
+        cellVol       = fp.CellVariable(mesh=mesh, value=mesh.cellVolumes)
+        contrVol      = cellVol.arithmeticFaceValue
+
+        faceVelocity[0] = (
+            xVelocity.arithmeticFaceValue 
+            + contrVol / ap.arithmeticFaceValue 
+              * (presGrad[0].arithmeticFaceValue - facePresGrad[0])
+        )
+        faceVelocity[1] = (
+            yVelocity.arithmeticFaceValue
+            + contrVol / ap.arithmeticFaceValue
+              * (presGrad[1].arithmeticFaceValue - facePresGrad[1])
+        )
+
+        # Zero out external faces
+        faceVelocity[..., mesh.exteriorFaces.value] = 0.
+
+        # (e) Pressure correction
+        pCorrEq.cacheRHSvector()
+        pRes = pCorrEq.sweep(var=pCorr)
+        rhs  = pCorrEq.RHSvector
+
+        # (f) Update p, velocity
+        pressure.setValue(pressure + pressureRelaxation * pCorr)
+        xVelocity.setValue(
+            xVelocity - (pCorr.grad[0]/ap)* mesh.cellVolumes
+        )
+        yVelocity.setValue(
+            yVelocity - (pCorr.grad[1]/ap)* mesh.cellVolumes
+        )
+
+        if sweep % 10 == 0:
+            print(f"SIMPLE sweep={sweep}, xRes={xRes}, yRes={yRes}, "
+                  f"pRes={pRes}, continuity={max(abs(rhs))}")
+
+###############################################################################
+# Mass transport variables (Convection–Diffusion)
+###############################################################################
+species = fp.CellVariable(mesh=mesh, name="species", value=0.0)
+D = 1e-3
+
+# Example BC: bottom = species=1, top=0
+species.constrain(1.0, facesBottom)
+species.constrain(0.0, facesTop)
+
+# left & right => zero gradient
+species.faceGrad[0].constrain(0.0, facesLeft)
+species.faceGrad[0].constrain(0.0, facesRight)
+
+massEq = (
+    fp.TransientTerm(var=species)
+    + fp.ConvectionTerm(coeff=(xVelocity, yVelocity), var=species)
+    == fp.DiffusionTerm(coeff=D, var=species)
 )
 
 ###############################################################################
-# 7. Solve Transiently
+# Main
 ###############################################################################
-timeStep = 1.0
-nSteps   = 200
-
 if __name__ == "__main__":
-    viewer = fp.Viewer(vars=(concentration,), datamin=0., datamax=1.0)
-    for step in range(nSteps):
-        eq.solve(dt=timeStep)
 
-    viewer.plot()
-    print("Time step:", step)
+    print("Solving momentum...")
+    solveMomentum(nSweeps=50)  # adjust as needed
+
+    print("Solving mass transport...")
+    dt = 1.0
+    steps = 50
+
+    viewer = fp.Viewer(vars=(species,), datamin=0., datamax=1.)
+    for step in range(steps):
+        massEq.solve(dt=dt)
+        if step % 10 == 0:
+            print(f"Mass step={step}")
+            viewer.plot()
+
+
 
 # %%
